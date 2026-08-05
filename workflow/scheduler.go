@@ -547,6 +547,7 @@ func (s *scheduler) run(yield func(*session.Event, error) bool) {
 		case <-doneChan:
 			if !draining {
 				draining = true
+				pendingErr = context.Cause(s.parentCtx)
 				s.cancelAll()
 			}
 			doneChan = nil // Disable this case so we don't busy loop
@@ -783,6 +784,13 @@ func (s *scheduler) handleCompletion(it completionItem, scheduleSuccessors bool)
 	delete(s.runsByName, it.nodeName)
 	delete(s.runCancels, it.nodeName)
 
+	// A cancellation of the invocation context is external to the
+	// scheduler. Do not mistake it for the cancellation of a sibling
+	// after another node failed; that cancellation does not affect the
+	// parent context.
+	if s.parentCtx.Err() != nil {
+		return context.Cause(s.parentCtx)
+	}
 	if errors.Is(it.err, context.Canceled) {
 		ns.Status = NodeCancelled
 		return nil // sibling cancellation; not the original error

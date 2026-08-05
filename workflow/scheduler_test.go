@@ -183,6 +183,48 @@ func TestScheduler_FailedSiblingsCancelled(t *testing.T) {
 	}
 }
 
+// TestScheduler_ExternalCancellationFailsRun verifies that cancellation of
+// the workflow's invocation context is surfaced to the caller, rather than
+// being mistaken for scheduler-initiated sibling cancellation.
+func TestScheduler_ExternalCancellationFailsRun(t *testing.T) {
+	mockCtx := newSeededMockCtx(t)
+	ctx, cancel := context.WithCancel(mockCtx.Context)
+	mockCtx = mockCtx.WithContext(ctx).(*MockInvocationContext)
+
+	n := newCancelObservingNode("n")
+	w := mustNew(t, []Edge{{From: Start, To: n}})
+
+	errCh := make(chan error, 1)
+	go func() {
+		var firstErr error
+		for _, err := range w.Run(mockCtx) {
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		errCh <- firstErr
+	}()
+
+	select {
+	case <-n.started:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for node to start")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Workflow.Run ended cleanly after external cancellation")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for workflow to finish")
+	}
+}
+
 // TestScheduler_CallerBreakStopsScheduling verifies that when the
 // caller breaks out of the event range loop, the scheduler stops
 // dispatching new successor nodes — not just stops yielding events.
@@ -407,15 +449,20 @@ func (n *erroringNode) Run(_ agent.Context, _ any) iter.Seq2[*session.Event, err
 // cancellation and timeout behaviour.
 type cancelObservingNode struct {
 	BaseNode
+	started        chan struct{}
 	cancelObserved atomic.Bool
 }
 
 func newCancelObservingNode(name string) *cancelObservingNode {
-	return &cancelObservingNode{BaseNode: NewBaseNode(name, "", NodeConfig{})}
+	return &cancelObservingNode{
+		BaseNode: NewBaseNode(name, "", NodeConfig{}),
+		started:  make(chan struct{}),
+	}
 }
 
 func (n *cancelObservingNode) Run(ctx agent.Context, _ any) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
+		close(n.started)
 		<-ctx.Done()
 		n.cancelObserved.Store(true)
 	}
