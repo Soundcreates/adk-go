@@ -35,12 +35,15 @@ type userFunctionCall struct {
 
 // toUserFunctionCall returns a non-nil struct when the last event in the session has a FunctionResponse
 // with user-provided data. The struct contains both call and response events.
-func getUserFunctionCallAt(events session.Events, index int) *userFunctionCall {
+// Both the response and the matching call must be in scope: without this, a
+// function call/response pair from a sibling scope can leak its TaskID,
+// contextID, and content into this invocation.
+func getUserFunctionCallAt(events session.Events, index int, scope string) *userFunctionCall {
 	if index < 0 || index >= events.Len() {
 		return nil
 	}
 	candidate := events.At(index)
-	if candidate.Author != "user" {
+	if candidate.Author != "user" || candidate.IsolationScope != scope {
 		return nil
 	}
 	fnCallID, ok := getFunctionResponseCallID(candidate)
@@ -49,7 +52,7 @@ func getUserFunctionCallAt(events session.Events, index int) *userFunctionCall {
 	}
 	for i := index - 1; i >= 0; i-- {
 		request := events.At(i)
-		if !isFunctionCallEvent(request, fnCallID) {
+		if request.IsolationScope != scope || !isFunctionCallEvent(request, fnCallID) {
 			continue
 		}
 		result := &userFunctionCall{response: candidate}
@@ -132,6 +135,23 @@ func toMissingRemoteSessionParts(ctx agent.InvocationContext, events session.Eve
 		result = append(result, parts...)
 	}
 	return result, contextID
+}
+
+// hasIsolationScopeHistory reports whether the session already holds at
+// least one event in the given scope. A scoped node dispatch seeds its first
+// turn from UserContent because AgentNode.Run seeds it without appending an
+// event, so the shared session has nothing in scope yet on that first
+// dispatch. Once the scope has any history, further seeding is wrong even if
+// every in-scope event has already been sent to the remote agent -- that
+// case should produce an empty message so run() short-circuits, not a resend
+// of the original input.
+func hasIsolationScopeHistory(events session.Events, scope string) bool {
+	for i := range events.Len() {
+		if events.At(i).IsolationScope == scope {
+			return true
+		}
+	}
+	return false
 }
 
 func presentAsUserMessage(ctx agent.InvocationContext, agentEvent *session.Event) *session.Event {
