@@ -1376,6 +1376,157 @@ func TestRemoteAgent_ScopedMessageUsesSeededInput(t *testing.T) {
 	}
 }
 
+func newScopedCtx(t *testing.T, agentName, scope string, userContent *genai.Content, events ...*session.Event) agent.InvocationContext {
+	t.Helper()
+	ctx := t.Context()
+	store := session.InMemoryService()
+	resp, err := store.Create(ctx, &session.CreateRequest{AppName: "test", UserID: "u"})
+	if err != nil {
+		t.Fatalf("store.Create() error = %v", err)
+	}
+	for _, e := range events {
+		if err := store.AppendEvent(ctx, resp.Session, e); err != nil {
+			t.Fatalf("store.AppendEvent() error = %v", err)
+		}
+	}
+	a, err := agent.New(agent.Config{Name: agentName})
+	if err != nil {
+		t.Fatalf("agent.New() error = %v", err)
+	}
+	return icontext.NewInvocationContext(ctx, icontext.InvocationContextParams{
+		Agent: a, Session: resp.Session, IsolationScope: scope, UserContent: userContent,
+	})
+}
+
+// Within one isolation scope, a second dispatch should keep the contextID
+// minted by the first and replay the same-scope turns the remote has not seen.
+func TestRemoteAgent_ScopedMessage_SameScopeContinuity(t *testing.T) {
+	const scope, remoteName = "workflow/node@1", "remote-agent"
+
+	first := newEventFromParts("user", genai.NewPartFromText("first request"))
+	first.IsolationScope = scope
+
+	remoteReply := &session.Event{
+		Author: remoteName,
+		LLMResponse: model.LLMResponse{
+			Content:        genai.NewContentFromParts([]*genai.Part{{Text: "first answer"}}, genai.RoleModel),
+			CustomMetadata: adka2a.ToCustomMetadata(a2a.NewTaskID(), "ctx-same-scope"),
+		},
+		Actions:        session.EventActions{StateDelta: map[string]any{}, ArtifactDelta: map[string]int64{}},
+		IsolationScope: scope,
+	}
+
+	follow := newEventFromParts("user", genai.NewPartFromText("follow-up in the same scope"))
+	follow.IsolationScope = scope
+
+	ictx := newScopedCtx(t, remoteName, scope, genai.NewContentFromText("first request", genai.RoleUser), first, remoteReply, follow)
+	msg, err := newMessage(ictx, A2AConfig{})
+	if err != nil {
+		t.Fatalf("newMessage() error = %v", err)
+	}
+	if msg.ContextID != "ctx-same-scope" {
+		t.Errorf("ContextID = %q, want same-scope contextID %q", msg.ContextID, "ctx-same-scope")
+	}
+	if len(msg.Parts) != 1 || msg.Parts[0].Text() != "follow-up in the same scope" {
+		t.Errorf("parts = %v, want the unsent same-scope turn", msg.Parts)
+	}
+}
+
+// Input-required resume: the reply must go back on the same TaskID/ContextID.
+func TestRemoteAgent_ScopedMessage_InputRequiredResume(t *testing.T) {
+	const scope, remoteName = "workflow/node@1", "remote-agent"
+	taskID := a2a.NewTaskID()
+
+	call := newEventFromParts(remoteName, &genai.Part{FunctionCall: &genai.FunctionCall{ID: "fc-1", Name: "ask_user"}})
+	call.CustomMetadata = adka2a.ToCustomMetadata(taskID, "ctx-resume")
+	call.IsolationScope = scope
+
+	answer := newEventFromParts("user", &genai.Part{FunctionResponse: &genai.FunctionResponse{
+		ID: "fc-1", Name: "ask_user", Response: map[string]any{"answer": "blue"},
+	}})
+	answer.IsolationScope = scope
+
+	ictx := newScopedCtx(t, remoteName, scope, genai.NewContentFromText("original node input", genai.RoleUser), call, answer)
+	msg, err := newMessage(ictx, A2AConfig{})
+	if err != nil {
+		t.Fatalf("newMessage() error = %v", err)
+	}
+	if msg.TaskID != taskID {
+		t.Errorf("TaskID = %q, want %q", msg.TaskID, taskID)
+	}
+	if msg.ContextID != "ctx-resume" {
+		t.Errorf("ContextID = %q, want %q", msg.ContextID, "ctx-resume")
+	}
+}
+
+// A scoped invocation with no seeded UserContent should still surface its own
+// in-scope history rather than producing an empty message.
+func TestRemoteAgent_ScopedMessage_NoUserContentUsesScopedHistory(t *testing.T) {
+	const scope, remoteName = "workflow/node@1", "remote-agent"
+
+	turn := newEventFromParts("user", genai.NewPartFromText("in-scope question"))
+	turn.IsolationScope = scope
+
+	ictx := newScopedCtx(t, remoteName, scope, nil, turn)
+	msg, err := newMessage(ictx, A2AConfig{})
+	if err != nil {
+		t.Fatalf("newMessage() error = %v", err)
+	}
+	if len(msg.Parts) == 0 {
+		t.Errorf("scoped invocation with nil UserContent produced an empty message; the in-scope turn was dropped")
+	}
+}
+
+// A same-scope event that the remote has not seen must be included even when
+// out-of-scope events are interleaved around it (positive control for the
+// utils.go isolation filter).
+func TestRemoteAgent_ScopedMessage_SameScopePositiveControl(t *testing.T) {
+	const scope, remoteName = "workflow/node@1", "remote-agent"
+
+	foreign := newEventFromParts("user", genai.NewPartFromText("sibling's turn"))
+	foreign.IsolationScope = "workflow/other@1"
+
+	inScope := newEventFromParts("user", genai.NewPartFromText("my turn"))
+	inScope.IsolationScope = scope
+
+	ictx := newScopedCtx(t, remoteName, scope, nil, foreign, inScope)
+	msg, err := newMessage(ictx, A2AConfig{})
+	if err != nil {
+		t.Fatalf("newMessage() error = %v", err)
+	}
+	if len(msg.Parts) != 1 || msg.Parts[0].Text() != "my turn" {
+		t.Errorf("parts = %v, want only the in-scope turn %q", msg.Parts, "my turn")
+	}
+}
+
+// A contextID minted in a different scope must not leak into this scope's
+// message (isolation case for the utils.go filter).
+func TestRemoteAgent_ScopedMessage_ContextIDIsolation(t *testing.T) {
+	const scope, remoteName = "workflow/node@1", "remote-agent"
+
+	foreignReply := &session.Event{
+		Author: remoteName,
+		LLMResponse: model.LLMResponse{
+			Content:        genai.NewContentFromParts([]*genai.Part{{Text: "sibling answer"}}, genai.RoleModel),
+			CustomMetadata: adka2a.ToCustomMetadata(a2a.NewTaskID(), "ctx-foreign-scope"),
+		},
+		Actions:        session.EventActions{StateDelta: map[string]any{}, ArtifactDelta: map[string]int64{}},
+		IsolationScope: "workflow/other@1",
+	}
+
+	ictx := newScopedCtx(t, remoteName, scope, genai.NewContentFromText("seeded input", genai.RoleUser), foreignReply)
+	msg, err := newMessage(ictx, A2AConfig{})
+	if err != nil {
+		t.Fatalf("newMessage() error = %v", err)
+	}
+	if msg.ContextID != "" {
+		t.Errorf("ContextID = %q, want empty — foreign-scope contextID must not leak in", msg.ContextID)
+	}
+	if len(msg.Parts) != 1 || msg.Parts[0].Text() != "seeded input" {
+		t.Errorf("parts = %v, want the seeded UserContent since scope has no history of its own", msg.Parts)
+	}
+}
+
 func TestRemoteAgent_CleanupCallback(t *testing.T) {
 	testCases := []struct {
 		name                  string
