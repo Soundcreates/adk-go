@@ -99,6 +99,9 @@ func toMissingRemoteSessionParts(ctx agent.InvocationContext, events session.Eve
 	lastRemoteResponseIndex := -1
 	for i := events.Len() - 1; i >= 0; i-- {
 		event := events.At(i)
+		// Isolation scopes require an exact match, so an unscoped invocation
+		// replays only unscoped events. This follows the session contract and
+		// matches the prompt-history filter's treatment of isolation scopes.
 		if event.IsolationScope != ctx.IsolationScope() {
 			continue
 		}
