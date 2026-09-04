@@ -327,6 +327,12 @@ func TestDatabaseService_AppendEvent_RefreshesStaleHandle(t *testing.T) {
 	}
 
 	base := time.Date(2026, time.December, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.AppendEvent(ctx, a.Session, &session.Event{
+		ID: "event-temp", Timestamp: base,
+		Actions: session.EventActions{StateDelta: map[string]any{"temp:review": "keep-me"}},
+	}); err != nil {
+		t.Fatalf("AppendEvent(temp): %v", err)
+	}
 	eventB := &session.Event{ID: "event-b", Timestamp: base.Add(2 * time.Second), Actions: session.EventActions{StateDelta: map[string]any{"from-b": true}}}
 	eventA := &session.Event{ID: "event-a", Timestamp: base.Add(time.Second), Actions: session.EventActions{StateDelta: map[string]any{"from-a": true}}}
 	if err := s.AppendEvent(ctx, b.Session, eventB); err != nil {
@@ -336,8 +342,11 @@ func TestDatabaseService_AppendEvent_RefreshesStaleHandle(t *testing.T) {
 		t.Fatalf("AppendEvent(a) after another writer: %v", err)
 	}
 
-	if got := a.Session.Events().Len(); got != 2 {
-		t.Fatalf("refreshed handle has %d events, want 2", got)
+	if got := a.Session.Events().Len(); got != 3 {
+		t.Fatalf("refreshed handle has %d events, want 3", got)
+	}
+	if got, err := a.Session.State().Get("temp:review"); err != nil || got != "keep-me" {
+		t.Errorf("refresh dropped local temp state: got %v, err %v", got, err)
 	}
 	if got, err := a.Session.State().Get("from-a"); err != nil || got != true {
 		t.Errorf("refreshed handle missing own state: got %v, err %v", got, err)
@@ -348,7 +357,7 @@ func TestDatabaseService_AppendEvent_RefreshesStaleHandle(t *testing.T) {
 	if got := a.Session.LastUpdateTime(); !got.Equal(base.Add(2 * time.Second)) {
 		t.Errorf("LastUpdateTime() = %v, want %v", got, base.Add(2*time.Second))
 	}
-	if diff := cmp.Diff([]string{"event-a", "event-b"}, eventIDs(a.Session)); diff != "" {
+	if diff := cmp.Diff([]string{"event-temp", "event-a", "event-b"}, eventIDs(a.Session)); diff != "" {
 		t.Errorf("refreshed handle events not in chronological order (-want +got):\n%s", diff)
 	}
 
@@ -356,8 +365,8 @@ func TestDatabaseService_AppendEvent_RefreshesStaleHandle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(final): %v", err)
 	}
-	if got.Session.Events().Len() != 2 {
-		t.Fatalf("database has %d events, want 2", got.Session.Events().Len())
+	if got.Session.Events().Len() != 3 {
+		t.Fatalf("database has %d events, want 3", got.Session.Events().Len())
 	}
 }
 
