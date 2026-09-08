@@ -35,15 +35,14 @@ type userFunctionCall struct {
 
 // toUserFunctionCall returns a non-nil struct when the last event in the session has a FunctionResponse
 // with user-provided data. The struct contains both call and response events.
-// Both the response and the matching call must be in scope: without this, a
-// function call/response pair from a sibling scope can leak its TaskID,
-// contextID, and content into this invocation.
+// The matching function call must be in scope so a function call from a sibling
+// scope cannot leak its TaskID or contextID into this invocation.
 func getUserFunctionCallAt(events session.Events, index int, scope string) *userFunctionCall {
 	if index < 0 || index >= events.Len() {
 		return nil
 	}
 	candidate := events.At(index)
-	if candidate.Author != "user" || candidate.IsolationScope != scope {
+	if candidate.Author != "user" {
 		return nil
 	}
 	fnCallID, ok := getFunctionResponseCallID(candidate)
@@ -99,9 +98,11 @@ func toMissingRemoteSessionParts(ctx agent.InvocationContext, events session.Eve
 	lastRemoteResponseIndex := -1
 	for i := events.Len() - 1; i >= 0; i-- {
 		event := events.At(i)
-		// Isolation scopes require an exact match, so an unscoped invocation
-		// replays only unscoped events. This follows the session contract and
-		// matches the prompt-history filter's treatment of isolation scopes.
+		// Isolation scopes require an exact match, so an unscoped invocation replays
+		// only unscoped events, per session.Event.IsolationScope. adk-python's remote
+		// agent gates this on task mode instead
+		// (remote_a2a_agent.py::_construct_message_parts_from_session); we follow the
+		// Go contract, which its own prompt-history filter already uses.
 		if event.IsolationScope != ctx.IsolationScope() {
 			continue
 		}
@@ -118,6 +119,7 @@ func toMissingRemoteSessionParts(ctx agent.InvocationContext, events session.Eve
 	result := make([]*a2a.Part, 0, partCount)
 	for i := lastRemoteResponseIndex + 1; i < events.Len(); i++ {
 		event := events.At(i)
+		// Same exact-match rule as above.
 		if event.IsolationScope != ctx.IsolationScope() {
 			continue
 		}
