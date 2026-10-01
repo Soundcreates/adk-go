@@ -136,6 +136,7 @@ func (s *databaseService) Create(ctx context.Context, req *session.CreateRequest
 	if err != nil {
 		return nil, err
 	}
+	val.createdAt = createdSession.CreateTime
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		storageApp, err := fetchStorageAppState(tx, req.AppName)
@@ -458,6 +459,14 @@ func (s *databaseService) refreshSession(ctx context.Context, sess *localSession
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	if !current.createdAt.Equal(sess.createdAt) {
+		return fmt.Errorf("session %q was deleted and recreated", sess.ID())
+	}
+	if current.updatedAt.Before(sess.updatedAt) {
+		// Another append through this handle committed after the snapshot was
+		// read. Installing the older snapshot would roll the handle backward.
+		return nil
+	}
 	// Keep the existing map identity so State values already handed to callers
 	// remain attached to the live session. Temporary state is local-only, so
 	// refresh the persisted keys without deleting it.
@@ -486,10 +495,19 @@ func (s *databaseService) applyEvent(ctx context.Context, sess *localSession, ev
 			return fmt.Errorf("failed to get session: %w", err)
 		}
 
-		// Ensure the session object is not stale.
+		// Ensure the row still represents the session that created this handle,
+		// then compare its OCC timestamp. A deleted and re-created session can
+		// reuse the same public ID but must not accept events from the old handle.
+		sess.mu.RLock()
+		sessionCreateTime := sess.createdAt
+		sessionUpdateTime := sess.updatedAt.UnixMicro()
+		sess.mu.RUnlock()
+		if !storageSess.CreateTime.Equal(sessionCreateTime) {
+			return fmt.Errorf("session %q was deleted and recreated", sess.ID())
+		}
+
 		// We use UnixMicro() for microsecond-level precision, matching the Python code.
 		storageUpdateTime := storageSess.UpdateTime.UnixMicro()
-		sessionUpdateTime := sess.updatedAt.UnixMicro()
 		if storageUpdateTime > sessionUpdateTime {
 			return fmt.Errorf(
 				"%w: last update time from request (%s) is older than in database (%s)",
