@@ -92,9 +92,11 @@ func AutoMigrate(service session.Service) error {
 }
 
 // EnableStaleRetry opts a database session service into refreshing a stale
-// OCC handle and retrying an append once, instead of returning
-// errStaleSession to the caller. Call it before sharing the service with
-// other goroutines. See issue #1229.
+// OCC handle and retrying an append once, instead of returning a stale-session
+// error to the caller. Call it before sharing the service with other
+// goroutines. A refresh replaces persisted state with the database snapshot;
+// direct non-temporary State().Set values that are not also carried by a
+// pending event are discarded. See issue #1229.
 //
 // NOTE: This function relies on a type assertion to the concrete
 // *databaseService implementation. It will return an error if the provided
@@ -422,17 +424,9 @@ func (s *databaseService) AppendEvent(ctx context.Context, curSession session.Se
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		err = s.applyEvent(ctx, sess, persistEvent)
 		if err == nil {
-			// Update the local handle only after the transaction commits. This
-			// keeps a failed append from leaving the caller with a phantom event.
-			if err := sess.appendEvent(event); err != nil {
-				return err
-			}
-			sess.mu.Lock()
-			if event.Timestamp.After(sess.updatedAt) {
-				sess.updatedAt = event.Timestamp
-			}
-			sess.mu.Unlock()
-			return nil
+			// Publish the event and its state delta only after the transaction
+			// commits, so a failed append cannot leave a phantom event.
+			return sess.appendEvent(event)
 		}
 		if !errors.Is(err, errStaleSession) || attempt == maxAttempts-1 {
 			return err
