@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -458,6 +459,124 @@ func TestDatabaseService_AppendEvent_DoesNotRetryNonStaleError(t *testing.T) {
 	}
 	if createAttempts != 1 {
 		t.Errorf("storage event create attempts = %d, want 1", createAttempts)
+	}
+}
+
+type pauseRefreshKey struct{}
+
+func TestDatabaseService_ConcurrentRefreshDoesNotInstallOlderSnapshot(t *testing.T) {
+	t0 := time.Date(2026, time.November, 30, 0, 0, 0, 0, time.UTC)
+	ctx := platform.WithTimeProvider(t.Context(), func() time.Time { return t0 })
+	s := emptyService(t)
+	if err := EnableStaleRetry(s); err != nil {
+		t.Fatalf("EnableStaleRetry: %v", err)
+	}
+	if _, err := s.Create(ctx, &session.CreateRequest{AppName: "app", UserID: "user", SessionID: "session"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	get := func() session.Session {
+		resp, err := s.Get(ctx, &session.GetRequest{AppName: "app", UserID: "user", SessionID: "session"})
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		return resp.Session
+	}
+
+	paused := make(chan struct{})
+	release := make(chan struct{})
+	var fired atomic.Bool
+	const callbackName = "test:pause-refresh-events-query"
+	if err := s.db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Context.Value(pauseRefreshKey{}) != nil &&
+			tx.Statement.Table == "events" &&
+			fired.CompareAndSwap(false, true) {
+			close(paused)
+			<-release
+		}
+	}); err != nil {
+		t.Fatalf("register query callback: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.db.Callback().Query().Remove(callbackName); err != nil {
+			t.Errorf("remove query callback: %v", err)
+		}
+	})
+
+	base := t0.Add(24 * time.Hour)
+	handle := get()
+	if err := s.AppendEvent(ctx, get(), &session.Event{ID: "outside", Timestamp: base.Add(time.Second)}); err != nil {
+		t.Fatalf("AppendEvent(outside): %v", err)
+	}
+
+	secondErr := make(chan error, 1)
+	go func() {
+		secondCtx := context.WithValue(ctx, pauseRefreshKey{}, true)
+		secondErr <- s.AppendEvent(secondCtx, handle, &session.Event{ID: "second", Timestamp: base.Add(3 * time.Second)})
+	}()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the second refresh")
+	}
+
+	if err := s.AppendEvent(ctx, handle, &session.Event{ID: "first", Timestamp: base.Add(2 * time.Second)}); err != nil {
+		t.Fatalf("AppendEvent(first): %v", err)
+	}
+	before := handle.LastUpdateTime()
+	close(release)
+	if err := <-secondErr; err != nil {
+		t.Fatalf("AppendEvent(second): %v", err)
+	}
+
+	found := false
+	for event := range handle.Events().All() {
+		found = found || event.ID == "first"
+	}
+	if !found {
+		t.Error("handle lost committed event first")
+	}
+	if got := handle.LastUpdateTime(); got.Before(before) {
+		t.Errorf("LastUpdateTime moved backwards: %v -> %v", before, got)
+	}
+}
+
+func TestDatabaseService_StaleRetryRejectsRecreatedSession(t *testing.T) {
+	var tick atomic.Int64
+	t0 := time.Date(2026, time.November, 30, 0, 0, 0, 0, time.UTC)
+	ctx := platform.WithTimeProvider(t.Context(), func() time.Time {
+		return t0.Add(time.Duration(tick.Add(1)) * time.Millisecond)
+	})
+	s := emptyService(t)
+	if err := EnableStaleRetry(s); err != nil {
+		t.Fatalf("EnableStaleRetry: %v", err)
+	}
+
+	req := &session.CreateRequest{AppName: "app", UserID: "user", SessionID: "session"}
+	if _, err := s.Create(ctx, req); err != nil {
+		t.Fatalf("Create(original): %v", err)
+	}
+	original, err := s.Get(ctx, &session.GetRequest{AppName: "app", UserID: "user", SessionID: "session"})
+	if err != nil {
+		t.Fatalf("Get(original): %v", err)
+	}
+	if err := s.Delete(ctx, &session.DeleteRequest{AppName: "app", UserID: "user", SessionID: "session"}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s.Create(ctx, req); err != nil {
+		t.Fatalf("Create(replacement): %v", err)
+	}
+
+	err = s.AppendEvent(ctx, original.Session, &session.Event{ID: "old-turn", Timestamp: t0.Add(time.Second)})
+	if err == nil {
+		t.Fatal("AppendEvent through old handle succeeded after session recreation")
+	}
+
+	replacement, getErr := s.Get(ctx, &session.GetRequest{AppName: "app", UserID: "user", SessionID: "session"})
+	if getErr != nil {
+		t.Fatalf("Get(replacement): %v", getErr)
+	}
+	if got := replacement.Session.Events().Len(); got != 0 {
+		t.Errorf("replacement session has %d events, want 0", got)
 	}
 }
 
