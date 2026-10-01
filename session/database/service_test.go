@@ -438,7 +438,9 @@ func TestDatabaseService_AppendEvent_DoesNotRetryNonStaleError(t *testing.T) {
 			return
 		}
 		createAttempts++
-		tx.AddError(injectedErr)
+		if err := tx.AddError(injectedErr); !errors.Is(err, injectedErr) {
+			t.Errorf("AddError() = %v, want injected error", err)
+		}
 	}); err != nil {
 		t.Fatalf("register create callback: %v", err)
 	}
