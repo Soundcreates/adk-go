@@ -325,6 +325,7 @@ func TestDatabaseService_AppendEvent_RefreshesStaleHandle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(b): %v", err)
 	}
+	retainedState := a.Session.State()
 
 	base := time.Date(2026, time.December, 1, 0, 0, 0, 0, time.UTC)
 	if err := s.AppendEvent(ctx, a.Session, &session.Event{
@@ -345,14 +346,14 @@ func TestDatabaseService_AppendEvent_RefreshesStaleHandle(t *testing.T) {
 	if got := a.Session.Events().Len(); got != 3 {
 		t.Fatalf("refreshed handle has %d events, want 3", got)
 	}
-	if got, err := a.Session.State().Get("temp:review"); err != nil || got != "keep-me" {
-		t.Errorf("refresh dropped local temp state: got %v, err %v", got, err)
+	if got, err := retainedState.Get("temp:review"); err != nil || got != "keep-me" {
+		t.Errorf("refresh dropped local temp state from retained State: got %v, err %v", got, err)
 	}
-	if got, err := a.Session.State().Get("from-a"); err != nil || got != true {
-		t.Errorf("refreshed handle missing own state: got %v, err %v", got, err)
+	if got, err := retainedState.Get("from-a"); err != nil || got != true {
+		t.Errorf("retained State missing own state after refresh: got %v, err %v", got, err)
 	}
-	if got, err := a.Session.State().Get("from-b"); err != nil || got != true {
-		t.Errorf("refreshed handle missing second writer state: got %v, err %v", got, err)
+	if got, err := retainedState.Get("from-b"); err != nil || got != true {
+		t.Errorf("retained State missing second writer state after refresh: got %v, err %v", got, err)
 	}
 	if got := a.Session.LastUpdateTime(); !got.Equal(base.Add(2 * time.Second)) {
 		t.Errorf("LastUpdateTime() = %v, want %v", got, base.Add(2*time.Second))
@@ -367,6 +368,94 @@ func TestDatabaseService_AppendEvent_RefreshesStaleHandle(t *testing.T) {
 	}
 	if got.Session.Events().Len() != 3 {
 		t.Fatalf("database has %d events, want 3", got.Session.Events().Len())
+	}
+}
+
+func TestDatabaseService_AppendEvent_StaleRetryStopsAfterOneRetry(t *testing.T) {
+	createdAt := time.Date(2026, time.November, 30, 0, 0, 0, 0, time.UTC)
+	ctx := platform.WithTimeProvider(t.Context(), func() time.Time { return createdAt })
+	s := emptyService(t)
+	if err := EnableStaleRetry(s); err != nil {
+		t.Fatalf("EnableStaleRetry: %v", err)
+	}
+
+	created, err := s.Create(ctx, &session.CreateRequest{AppName: "app", UserID: "user", SessionID: "session"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	const callbackName = "test:force-stale-session"
+	sessionQueries := 0
+	if err := s.db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		stored, ok := tx.Statement.Dest.(*storageSession)
+		if !ok {
+			return
+		}
+		sessionQueries++
+		// The first and third session reads are the two apply attempts. The
+		// second is refreshSession's Get and must remain the real snapshot.
+		if sessionQueries == 1 || sessionQueries == 3 {
+			stored.UpdateTime = stored.UpdateTime.Add(time.Hour)
+		}
+	}); err != nil {
+		t.Fatalf("register query callback: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.db.Callback().Query().Remove(callbackName); err != nil {
+			t.Errorf("remove query callback: %v", err)
+		}
+	})
+
+	err = s.AppendEvent(ctx, created.Session, &session.Event{
+		ID: "event", Timestamp: createdAt.Add(time.Second),
+	})
+	if !errors.Is(err, errStaleSession) {
+		t.Fatalf("AppendEvent error = %v, want errStaleSession", err)
+	}
+	if sessionQueries != 3 {
+		t.Errorf("session query count = %d, want 3 (apply, refresh, apply)", sessionQueries)
+	}
+}
+
+func TestDatabaseService_AppendEvent_DoesNotRetryNonStaleError(t *testing.T) {
+	createdAt := time.Date(2026, time.November, 30, 0, 0, 0, 0, time.UTC)
+	ctx := platform.WithTimeProvider(t.Context(), func() time.Time { return createdAt })
+	s := emptyService(t)
+	if err := EnableStaleRetry(s); err != nil {
+		t.Fatalf("EnableStaleRetry: %v", err)
+	}
+
+	created, err := s.Create(ctx, &session.CreateRequest{AppName: "app", UserID: "user", SessionID: "session"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	injectedErr := errors.New("injected storage event failure")
+	const callbackName = "test:fail-storage-event-create"
+	createAttempts := 0
+	if err := s.db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if _, ok := tx.Statement.Dest.(*storageEvent); !ok {
+			return
+		}
+		createAttempts++
+		tx.AddError(injectedErr)
+	}); err != nil {
+		t.Fatalf("register create callback: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.db.Callback().Create().Remove(callbackName); err != nil {
+			t.Errorf("remove create callback: %v", err)
+		}
+	})
+
+	err = s.AppendEvent(ctx, created.Session, &session.Event{
+		ID: "event", Timestamp: createdAt.Add(time.Second),
+	})
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("AppendEvent error = %v, want injected error", err)
+	}
+	if createAttempts != 1 {
+		t.Errorf("storage event create attempts = %d, want 1", createAttempts)
 	}
 }
 
