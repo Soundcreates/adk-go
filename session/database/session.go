@@ -37,6 +37,7 @@ type localSession struct {
 	mu        sync.RWMutex
 	events    []*session.Event
 	state     map[string]any
+	createdAt time.Time
 	updatedAt time.Time
 
 	// Keep the event window used to create this handle so an OCC refresh can
