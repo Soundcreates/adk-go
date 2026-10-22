@@ -690,7 +690,7 @@ func eventIDs(sess session.Session) []string {
 }
 
 // TestDatabaseService_AppendEvent_StaleRetryIsOptIn guards the default
-// behaviour: without EnableStaleRetry, a stale handle keeps failing instead
+// behavior: without EnableStaleRetry, a stale handle keeps failing instead
 // of silently retrying and overwriting whatever the caller wanted to
 // recompute against the newer state.
 func TestDatabaseService_AppendEvent_StaleRetryIsOptIn(t *testing.T) {
